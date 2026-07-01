@@ -19,6 +19,8 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // Requerido por NewPipeExtractor, publicado como artefacto de GitHub vía JitPack.
+        maven { url = uri("https://jitpack.io") }
     }
 }
 

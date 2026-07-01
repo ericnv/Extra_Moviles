@@ -34,6 +34,9 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+        // NewPipeExtractor usa java.time internamente (p. ej. fechas de subida), que
+        // requiere API 26+ sin desugaring. minSdk aquí es 23.
+        isCoreLibraryDesugaringEnabled = true
     }
     buildFeatures {
         compose = true
@@ -52,6 +55,11 @@ dependencies {
     implementation(libs.androidx.media3.ui)
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
+    // Extracción real de YouTube (búsqueda + streams) usando la misma librería que usa
+    // la app NewPipe. Reemplaza las instancias públicas de Piped/Invidious, que están
+    // caídas/no confiables y causaban resultados viejos y streams que nunca cargaban.
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.3")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     testImplementation(libs.junit)

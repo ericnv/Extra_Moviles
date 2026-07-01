@@ -13,6 +13,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -122,35 +124,44 @@ class BluetoothManager(private val context: Context) {
         }
     }
 
-    // Usar un lock para que los hilos no escriban al mismo tiempo
-    private val sendLock = Any()
+    // Mutex en vez de "synchronized": serializa el ORDEN real de envío,
+    // no solo evita escrituras solapadas. Antes, cada sendData() lanzaba su propia
+    // corrutina en Dispatchers.IO y el orden de adquisición del lock no coincidía
+    // necesariamente con el orden de llamada, lo que podía enviar los bloques del
+    // video fuera de orden y corromper el archivo recibido en el cliente.
+    private val sendMutex = Mutex()
 
+    // Fire-and-forget: para mensajes sueltos disparados desde la UI (no forman parte
+    // de una secuencia que deba preservar orden).
     fun sendData(type: Int, data: ByteArray) {
-        scope.launch {
-            synchronized(sendLock) {
-                try {
-                    if (socket == null || !socket!!.isConnected) {
-                        Log.w("BT", "No hay socket conectado para enviar tipo $type")
-                        return@synchronized
-                    }
+        scope.launch { sendDataOrdered(type, data) }
+    }
 
-                    val out = socket?.outputStream ?: run {
-                        Log.w("BT", "No hay output stream para enviar tipo $type")
-                        return@synchronized
-                    }
-                    outputStream = out
-
-                    val header = ByteBuffer.allocate(BTProtocol.HEADER_SIZE)
-                        .put(type.toByte())
-                        .putInt(data.size)
-                        .array()
-                    out.write(header)
-                    out.write(data)
-                    out.flush()
-                    Log.d("BT_MANAGER", "Enviado tipo=$type, size=${data.size}")
-                } catch (e: IOException) {
-                    Log.e("BT", "Error enviando tipo $type", e)
+    // Debe llamarse siempre desde la misma corrutina/secuencia cuando el orden importa
+    // (p. ej. el bucle de streaming de video), ya que el suspend + mutex garantiza que
+    // los envíos se sirvan en el orden en que se invoca esta función.
+    suspend fun sendDataOrdered(type: Int, data: ByteArray) {
+        sendMutex.withLock {
+            try {
+                val currentSocket = socket
+                if (currentSocket == null || !currentSocket.isConnected) {
+                    Log.w("BT", "No hay socket conectado para enviar tipo $type")
+                    return@withLock
                 }
+
+                val out = currentSocket.outputStream
+                outputStream = out
+
+                val header = ByteBuffer.allocate(BTProtocol.HEADER_SIZE)
+                    .put(type.toByte())
+                    .putInt(data.size)
+                    .array()
+                out.write(header)
+                out.write(data)
+                out.flush()
+                Log.d("BT_MANAGER", "Enviado tipo=$type, size=${data.size}")
+            } catch (e: IOException) {
+                Log.e("BT", "Error enviando tipo $type", e)
             }
         }
     }

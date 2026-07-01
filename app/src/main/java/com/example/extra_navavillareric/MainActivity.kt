@@ -33,6 +33,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.example.extra_navavillareric.ui.theme.AppThemeType
@@ -175,40 +177,10 @@ class MainActivity : ComponentActivity() {
                     serverStatusMsg = "Buscando video en YouTube..."
                 }
 
-                val endpoints = listOf(
-                    "https://pipedapi.kavin.rocks/streams/$videoId",
-                    "https://api.piped.dev/streams/$videoId",
-                    "https://pipedapi.riverside.rocks/streams/$videoId",
-                    "https://yewtu.be/api/v1/videos/$videoId"
-                )
-
-                var streamUrl = ""
-                for (url in endpoints) {
-                    try {
-                        Log.d("SERVER_FLOW", "Consultando metadata en: $url")
-                        val request = Request.Builder()
-                            .url(url)
-                            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                            .build()
-                        
-                        httpClient.newCall(request).execute().use { response ->
-                            val responseBody = response.body?.string() ?: ""
-                            if (response.isSuccessful && responseBody.isNotBlank()) {
-                                Log.d("SERVER_FLOW", "Respuesta metadata recibida (${responseBody.length} bytes)")
-                                streamUrl = searchManager.extractStreamUrl(responseBody)
-                                if (streamUrl.isNotBlank()) {
-                                    Log.d("SERVER_FLOW", "Stream URL obtenida con éxito desde $url")
-                                    return@use
-                                }
-                            } else {
-                                Log.w("SERVER_FLOW", "Endpoint $url devolvió código ${response.code}")
-                            }
-                        }
-                        if (streamUrl.isNotBlank()) break
-                    } catch (e: Exception) {
-                        Log.w("SERVER_FLOW", "Fallo consulta metadata: $url", e)
-                    }
-                }
+                // Extracción real vía NewPipeExtractor (misma librería que la app NewPipe),
+                // en vez de las antiguas instancias públicas de Piped/Invidious, que estaban
+                // caídas/no confiables y hacían que ningún video llegara a reproducirse.
+                val streamUrl = searchManager.extractStreamUrl(videoId)
 
                 if (streamUrl.isBlank()) {
                     Log.e("SERVER_FLOW", "Error: No se pudo obtener la URL de descarga directa")
@@ -238,11 +210,12 @@ class MainActivity : ComponentActivity() {
                     val inputStream = response.body?.byteStream() ?: throw Exception("Cuerpo de respuesta vacío")
                     val sessionId = "sess-${System.currentTimeMillis()}"
 
-                    bluetoothManager.sendData(BTProtocol.TYPE_CONTROL_CMD, "SESSION_START:$sessionId".toByteArray(StandardCharsets.UTF_8))
-                    delay(100)
-                    bluetoothManager.sendData(BTProtocol.TYPE_CONTROL_CMD, "SIZE:$totalSize".toByteArray(StandardCharsets.UTF_8))
-                    delay(100)
-                    bluetoothManager.sendData(BTProtocol.TYPE_CONTROL_CMD, "START_STREAM".toByteArray(StandardCharsets.UTF_8))
+                    // Todos los envíos de esta secuencia usan sendDataOrdered (misma corrutina,
+                    // protegido por mutex) para que lleguen al cliente en el mismo orden en que
+                    // se generan: SESSION_START -> SIZE -> START_STREAM -> bloques -> END_STREAM.
+                    bluetoothManager.sendDataOrdered(BTProtocol.TYPE_CONTROL_CMD, "SESSION_START:$sessionId".toByteArray(StandardCharsets.UTF_8))
+                    bluetoothManager.sendDataOrdered(BTProtocol.TYPE_CONTROL_CMD, "SIZE:$totalSize".toByteArray(StandardCharsets.UTF_8))
+                    bluetoothManager.sendDataOrdered(BTProtocol.TYPE_CONTROL_CMD, "START_STREAM".toByteArray(StandardCharsets.UTF_8))
 
                     val chunkSize = 16 * 1024
                     val buffer = ByteArray(chunkSize)
@@ -252,23 +225,23 @@ class MainActivity : ComponentActivity() {
                     while (true) {
                         bytesRead = inputStream.read(buffer)
                         if (bytesRead <= 0) break
-                        
+
                         serverDownloadBytes += bytesRead
-                        
+
                         val chunk = buffer.copyOf(bytesRead)
                         val block = TransferBlock(sessionId, blockIndex, serverUploadBytes, chunk, false)
-                        bluetoothManager.sendData(BTProtocol.TYPE_TRANSFER_BLOCK, block.toByteArray())
-                        
+                        bluetoothManager.sendDataOrdered(BTProtocol.TYPE_TRANSFER_BLOCK, block.toByteArray())
+
                         serverUploadBytes += bytesRead
                         blockIndex += 1
-                        
+
                         // Delay para estabilidad Samsung S10/Tab A8
-                        delay(25) 
+                        delay(25)
                     }
 
                     val lastBlock = TransferBlock(sessionId, blockIndex, serverUploadBytes, ByteArray(0), true)
-                    bluetoothManager.sendData(BTProtocol.TYPE_TRANSFER_BLOCK, lastBlock.toByteArray())
-                    bluetoothManager.sendData(BTProtocol.TYPE_CONTROL_CMD, "END_STREAM".toByteArray(StandardCharsets.UTF_8))
+                    bluetoothManager.sendDataOrdered(BTProtocol.TYPE_TRANSFER_BLOCK, lastBlock.toByteArray())
+                    bluetoothManager.sendDataOrdered(BTProtocol.TYPE_CONTROL_CMD, "END_STREAM".toByteArray(StandardCharsets.UTF_8))
                     withContext(Dispatchers.Main) { serverStatusMsg = "Transferencia Exitosa (100%)" }
                     Log.d("SERVER_FLOW", "Transferencia completada al 100% de $totalSize bytes")
                 }
@@ -310,8 +283,9 @@ fun ClientScreen(bluetoothManager: BluetoothManager, onBack: () -> Unit) {
                         Log.d("CLIENT", "JSON recibido (${data.size} bytes)")
                         val results = jsonDecoder.decodeFromString<List<VideoModel>>(jsonStr)
                         
-                        if (results.any { it.id == "error" }) {
-                            searchStatus = "El servidor no tiene internet o las APIs fallaron"
+                        val errorResult = results.firstOrNull { it.id == "error" }
+                        if (errorResult != null) {
+                            searchStatus = errorResult.snippet.ifBlank { "El servidor no pudo completar la búsqueda" }
                             videoResults = emptyList()
                         } else {
                             videoResults = results
@@ -338,7 +312,12 @@ fun ClientScreen(bluetoothManager: BluetoothManager, onBack: () -> Unit) {
                         isDownloadComplete = true
                         searchStatus = "Transferencia finalizada"
                     } else if (cmd == "ERROR_STREAM") {
-                        searchStatus = "No se pudo obtener el stream del video"
+                        // Antes esto solo actualizaba searchStatus, pero esa vista queda oculta
+                        // detrás del reproductor (que ya se mostró en negro al seleccionar el
+                        // video). Sin esto, el usuario se queda viendo una pantalla negra para
+                        // siempre sin saber que el servidor no pudo obtener el stream.
+                        playingVideo = null
+                        searchStatus = "No se pudo obtener el stream del video (revisa la conexión a Internet del servidor)"
                     }
                 }
                 BTProtocol.TYPE_TRANSFER_BLOCK -> {
@@ -464,6 +443,21 @@ fun VideoPlayerScreen(video: VideoModel, file: File, bytes: Long, isComplete: Bo
     var playerInitialized by remember { mutableStateOf(false) }
     var playbackStatus by remember { mutableStateOf("Esperando datos...") }
     val exoPlayer = remember(context) { ExoPlayer.Builder(context).build() }
+
+    // Sin este listener, un fallo de ExoPlayer (archivo incompleto/corrupto, moov atom
+    // ausente, códec no soportado) ocurre de forma asíncrona en su hilo interno y nunca
+    // se ve: la UI ya marcó playerInitialized=true y solo se ve un PlayerView negro sin
+    // ningún frame, sin ninguna pista de qué falló.
+    DisposableEffect(exoPlayer) {
+        val listener = object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                Log.e("PLAYER_DEBUG", "Error de reproducción ExoPlayer", error)
+                playbackStatus = "Error de reproducción: ${error.errorCodeName}"
+            }
+        }
+        exoPlayer.addListener(listener)
+        onDispose { exoPlayer.removeListener(listener) }
+    }
 
     // Log para depurar qué está pasando con el archivo
     LaunchedEffect(bytes, isComplete) {
