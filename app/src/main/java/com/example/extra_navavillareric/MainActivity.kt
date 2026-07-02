@@ -39,7 +39,9 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.example.extra_navavillareric.ui.theme.AppThemeType
 import com.example.extra_navavillareric.ui.theme.Extra_NavaVillarEricTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
@@ -69,6 +71,11 @@ class MainActivity : ComponentActivity() {
     private var serverUploadBytes by mutableStateOf(0L)
     private var serverTotalBytes by mutableStateOf(0L)
     private var serverStatusMsg by mutableStateOf("Servidor listo")
+
+    // Job de la transferencia en curso: si llega una nueva solicitud STREAM antes de que
+    // termine la anterior, se cancela para no seguir enviando bloques de un video que el
+    // cliente ya no quiere ver.
+    private var streamingJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -105,7 +112,8 @@ class MainActivity : ComponentActivity() {
                         val cmd = String(data, StandardCharsets.UTF_8)
                         Log.d("SERVER_CMD", "Comando recibido en Servidor: $cmd")
                         if (cmd.startsWith("STREAM:")) {
-                            startStreamingRealVideo(cmd.substring(7))
+                            streamingJob?.cancel()
+                            streamingJob = startStreamingRealVideo(cmd.substring(7))
                         }
                     }
                 }
@@ -165,9 +173,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startStreamingRealVideo(videoId: String) {
+    private fun startStreamingRealVideo(videoId: String): Job {
         Log.d("SERVER_FLOW", "Iniciando proceso para videoID: $videoId")
-        lifecycleScope.launch(Dispatchers.IO) {
+        return lifecycleScope.launch(Dispatchers.IO) {
             try {
                 // Reset de progreso visible inmediatamente
                 withContext(Dispatchers.Main) {
@@ -245,6 +253,13 @@ class MainActivity : ComponentActivity() {
                     withContext(Dispatchers.Main) { serverStatusMsg = "Transferencia Exitosa (100%)" }
                     Log.d("SERVER_FLOW", "Transferencia completada al 100% de $totalSize bytes")
                 }
+            } catch (e: CancellationException) {
+                // El job fue cancelado porque el usuario pidió otro video antes de que este
+                // terminara: no es una falla real, así que no se envía ERROR_STREAM (eso
+                // confundiría/interrumpiría la sesión del video nuevo). Se debe re-lanzar
+                // para que la cancelación de la corrutina se propague correctamente.
+                Log.d("SERVER_FLOW", "Streaming cancelado (reemplazado por una nueva solicitud): $videoId")
+                throw e
             } catch (e: Exception) {
                 Log.e("SERVER_FLOW", "Error crítico en el proceso de descarga/envío", e)
                 withContext(Dispatchers.Main) { serverStatusMsg = "Fallo Crítico: ${e.message}" }
@@ -327,6 +342,12 @@ fun ClientScreen(bluetoothManager: BluetoothManager, onBack: () -> Unit) {
                             bluetoothManager.sendData(BTProtocol.TYPE_TRANSFER_NACK, "bad-block".toByteArray(StandardCharsets.UTF_8))
                             return@collect
                         }
+                        if (block.sessionId != currentSessionId) {
+                            // Bloque de una sesión de streaming anterior (ej. el usuario ya pidió
+                            // otro video y el servidor todavía tenía bloques viejos en vuelo).
+                            // Se descarta para no mezclar dos videos en el mismo archivo.
+                            return@collect
+                        }
                         FileOutputStream(tempFile, true).use { it.write(block.data) }
                         bytesReceived += block.data.size
                         blocksReceived += 1
@@ -404,6 +425,18 @@ fun ClientScreen(bluetoothManager: BluetoothManager, onBack: () -> Unit) {
                                 searchStatus = "Mostrando resultado web"
                                 return@VideoResultCard
                             }
+
+                            // Limpiar el estado de transferencia AQUÍ, no al recibir SESSION_START:
+                            // ese mensaje tarda en llegar (el servidor debe volver a extraer el
+                            // stream), y en ese lapso el reproductor se montaba con los bytes y el
+                            // archivo del video anterior, que ya cumplían la condición de "hay
+                            // buffer suficiente" y arrancaban a reproducir el video equivocado.
+                            if (tempFile.exists()) tempFile.delete()
+                            bytesReceived = 0
+                            blocksReceived = 0
+                            totalBytesExpected = 0
+                            isDownloadComplete = false
+                            currentSessionId = null
 
                             playingVideo = video
                             searchStatus = "Solicitando stream: ${video.title}"
